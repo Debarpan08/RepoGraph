@@ -437,12 +437,12 @@ def _question_context(graph: Any, repository: str, question: str) -> tuple[list[
 	return matches, citations, evidence
 
 
-def answer_question(graph: Any, repository: str, question: str) -> dict[str, Any]:
+def answer_question(graph: Any, repository: str, question: str, user_api_key: str | None = None) -> dict[str, Any]:
 	matches, citations, context = _question_context(graph, repository, question)
 	if not matches:
 		return {"answer": "I couldn't find a matching symbol or source file in the analyzed repository. Try a class, service, database, or feature name.", "sources": []}
 
-	api_key = os.getenv("GEMINI_API_KEY")
+	api_key = (user_api_key or "").strip() or os.getenv("GEMINI_API_KEY")
 	if api_key:
 		base_url = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 		model = urllib.parse.quote(os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"), safe="")
@@ -517,14 +517,26 @@ class RepoGraphHandler(BaseHTTPRequestHandler):
 		self.send_header("Content-Type", "application/json; charset=utf-8")
 		self.send_header("Content-Length", str(len(raw)))
 		self.send_header("Access-Control-Allow-Origin", "*")
+		self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		self.end_headers()
 		self.wfile.write(raw)
 
+	def do_OPTIONS(self) -> None:
+		self.send_response(200)
+		self.send_header("Access-Control-Allow-Origin", "*")
+		self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		self.end_headers()
+
 	def do_GET(self) -> None:
-		path = urllib.parse.urlparse(self.path).path
-		if path == "/":
+		path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+		if path in ("/", ""):
+			html_path = os.path.join(os.path.dirname(__file__), "index.html")
+			if not os.path.exists(html_path):
+				html_path = os.path.join(os.getcwd(), "index.html")
 			try:
-				with open(os.path.join(os.path.dirname(__file__), "index.html"), "rb") as page:
+				with open(html_path, "rb") as page:
 					body = page.read()
 				self.send_response(200)
 				self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -533,13 +545,13 @@ class RepoGraphHandler(BaseHTTPRequestHandler):
 				self.wfile.write(body)
 			except OSError:
 				self._json(500, {"error": "index.html is missing"})
-		elif path == "/api/health":
+		elif path in ("/api/health", "/health"):
 			try:
 				_get_graph().query("RETURN 1")
 				self._json(200, {"database": "connected", "llm": bool(os.getenv("GEMINI_API_KEY"))})
 			except Exception as error:
 				self._json(503, {"database": "disconnected", "error": str(error)})
-		elif path == "/api/repository":
+		elif path in ("/api/repository", "/repository"):
 			repository = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("name", [""])[0]
 			try:
 				self._json(200, _graph_snapshot(_get_graph(), repository))
@@ -554,7 +566,8 @@ class RepoGraphHandler(BaseHTTPRequestHandler):
 			if length <= 0 or length > 16_000:
 				raise ValueError("Request body is missing or too large.")
 			payload = json.loads(self.rfile.read(length))
-			if self.path == "/api/analyze":
+			path = urllib.parse.urlparse(self.path).path.rstrip("/")
+			if path in ("/api/analyze", "/analyze"):
 				owner, repo = _decode_repository_url(str(payload.get("url", "")))
 				files = fetch_repository(owner, repo)
 				repository = f"{owner}/{repo}"
@@ -562,18 +575,23 @@ class RepoGraphHandler(BaseHTTPRequestHandler):
 				store_repository(_get_graph(), repository, nodes, edges)
 				snapshot = _graph_snapshot(_get_graph(), repository)
 				self._json(200, {**snapshot, "fileCount": len(files), "indexedAt": __import__("datetime").datetime.now().isoformat(timespec="minutes")})
-			elif self.path == "/api/ask":
+			elif path in ("/api/ask", "/ask"):
 				repository = str(payload.get("repository", ""))
 				question = str(payload.get("question", "")).strip()
+				user_api_key = str(payload.get("apiKey", "")).strip() or None
 				if not repository or not question or len(question) > 1000:
 					raise ValueError("Choose an analyzed repository and enter a question under 1,000 characters.")
-				self._json(200, answer_question(_get_graph(), repository, question))
+				self._json(200, answer_question(_get_graph(), repository, question, user_api_key=user_api_key))
 			else:
 				self._json(404, {"error": "Not found"})
 		except (ValueError, json.JSONDecodeError) as error:
 			self._json(400, {"error": str(error)})
 		except Exception as error:
 			self._json(502, {"error": str(error)})
+
+
+# Export handler for Vercel Python runtime
+handler = RepoGraphHandler
 
 
 def _self_test() -> None:
